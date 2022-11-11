@@ -1,0 +1,383 @@
+---
+title: "DSII Final Project"
+author: "Yiru Gong, yg2832; Yiwen Zhao, yz4187; Jiaqi Chen, jc5681"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyhead[R]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+--- 
+
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r, echo = T, message = FALSE, results='hide', warning=FALSE}
+library(tidyverse)
+library(summarytools)
+library(corrplot)
+library(caret)
+library(MASS)
+library(mlbench)
+library(pROC) #ROCR
+library(pdp)
+library(vip)
+library(AppliedPredictiveModeling) #for transparentTheme function
+library(keras)
+library(tfruns)
+library(ISLR)
+library(caret)
+library(e1071)
+library(kernlab)
+library(ranger)
+```
+
+# Data Input
+
+```{r,results = 'asis'}
+data = read.csv('Covid19_vacc_predict_handout.csv')
+data = data %>% 
+  na.omit() %>% 
+  dplyr::select(-id) %>% 
+  mutate(
+    atlas_type_2015_mining_no = factor(atlas_type_2015_mining_no),
+    covid_vaccination = factor(covid_vaccination),
+    hum_region = factor(hum_region),
+    sex_cd = factor(sex_cd),
+    race_cd = factor(race_cd),
+    lang_spoken_cd = factor(lang_spoken_cd),
+    atlas_low_education_2015_update = factor(atlas_low_education_2015_update)
+    )
+dfSummary(data[,c(5,7,8,10,11,17,18)])
+
+data2 = model.matrix(covid_vaccination ~ ., data)[ ,-1]
+```
+
+# Exploratory analysis
+
+```{r,fig.width=12,fig.height=9}
+theme1 <- transparentTheme(trans = .4)
+trellis.par.set(theme1)
+
+#figure 1
+featurePlot(x = data[,-c(5,7,8,10,11,17,18)], 
+            y = data$covid_vaccination,
+            scales = list(x = list(relation = "free"), 
+                          y = list(relation = "free")),
+            plot = "density", pch = "|", 
+            auto.key = list(columns = 2))
+
+#correlation
+corrplot(cor(data[,-c(5,7,8,10,11,17,18)]), method = "circle", type = "full")
+```
+
+## Data split
+
+```{r}
+set.seed(1)
+rowTrain <- createDataPartition(y = data$covid_vaccination,
+                                p = 0.7,
+                                list = FALSE)
+x = data2[rowTrain,]
+y = data$covid_vaccination[rowTrain]
+x2 = data2[-rowTrain,]
+y2 = data$covid_vaccination[-rowTrain]
+
+save(x,y,x2,y2,file = "split_data.Rdata")
+```
+
+# Model fitting
+
+## Penalized logistic regression (GLMNET)
+
+```{r}
+ctrl <- trainControl(method = "cv",
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE)
+
+glmnGrid <- expand.grid(.alpha = seq(0, 1, length = 21),
+                        .lambda = exp(seq(-8, -1, length = 50)))
+set.seed(1)
+model.glmn <- train(x, y,
+                    method = "glmnet",
+                    tuneGrid = glmnGrid,
+                    metric = "ROC",
+                    trControl = ctrl)
+
+model.glmn$bestTune
+
+myCol<- rainbow(25)
+myPar <- list(superpose.symbol = list(col = myCol),
+              superpose.line = list(col = myCol))
+
+plot(model.glmn, par.settings = myPar, xTrans = function(x) log(x))
+```
+
+## GAM
+
+```{r,fig.width=9,fig.height=12}
+set.seed(1)
+model.gam <- train(data[rowTrain,-c(7:8)], y,
+                   method = "gam",
+                   metric = "ROC",
+                   trControl = ctrl)
+### row 8: hum_region report error
+
+model.gam$finalModel
+
+# fig 2
+par(mfrow=c(4,3))
+plot(model.gam$finalModel)
+```
+
+## LDA
+
+```{r}
+lda.fit <- lda(y~x)
+plot(lda.fit)
+
+set.seed(1)
+model.lda <- train(x, y,
+                   method = "lda",
+                   metric = "ROC",
+                   trControl = ctrl)
+```
+
+## Random Forest
+
+```{r}
+# rf.ctrl <- trainControl(method = "cv",
+#                      classProbs = TRUE,
+#                      summaryFunction = twoClassSummary)
+
+rf.grid <- expand.grid(mtry = 1:8,
+                       splitrule = "gini",
+                       min.node.size = seq(from = 2, to = 10,
+                                           by = 2))
+
+set.seed(1)
+rf.fit <- train(covid_vaccination ~ . ,
+                data,
+                subset = rowTrain,
+                method = "ranger",
+                tuneGrid = rf.grid,
+                metric = "ROC",
+                trControl = ctrl)
+
+ggplot(rf.fit, highlight = TRUE)
+```
+
+```{r}
+# variable importance
+set.seed(1)
+rf2.final.per <- ranger(covid_vaccination ~ . ,
+                data[rowTrain,],
+                mtry = rf.fit$bestTune[[1]],
+                min.node.size = rf.fit$bestTune[[3]],
+                splitrule = "gini",
+                importance = "permutation",
+                scale.permutation.importance = TRUE)
+
+par(mar = c(3,12,3,3))
+barplot(sort(ranger::importance(rf2.final.per), decreasing = FALSE),
+        las = 2, horiz = TRUE, cex.names = 0.7, 
+        col = colorRampPalette(colors = c("cyan","blue"))(17))
+```
+
+
+## Support Vector Machine
+
+```{r}
+data$covid_vaccination <- factor(data$covid_vaccination, c("vacc", "no_vacc"))
+dat <- data[-c(5,8,10,11,17,18)]
+summary(dat)
+
+# SVM with Linear Kernal
+# ctrl1 <- trainControl(method = "cv")
+set.seed(1)
+svml.fit <- train(covid_vaccination ~ . , 
+                  data = dat[rowTrain,], 
+                  method = "svmLinear",
+                  metric = "ROC",
+                  # preProcess = c("center", "scale"),
+                  tuneGrid = data.frame(C = exp(seq(-5,2,len=50))),
+                  trControl = ctrl)
+
+plot(svml.fit, highlight = TRUE, xTrans = log)
+svml.fit$bestTune
+
+# SVM with Radial Kernel
+svmr.grid <- expand.grid(C = exp(seq(-1,4,len=20)),
+                         sigma = exp(seq(-6,-2,len=20)))
+
+set.seed(1)             
+svmr.fit <- train(covid_vaccination ~ . , dat, 
+                  subset = rowTrain,
+                  method = "svmRadialSigma",
+                  metric = "ROC",
+                  tuneGrid = svmr.grid,
+                  trControl = ctrl)
+
+myCol <- rainbow(20)
+myPar <- list(superpose.symbol = list(col = myCol),
+              superpose.line = list(col = myCol))
+
+plot(svmr.fit, highlight = TRUE, par.settings = myPar)
+svmr.fit$bestTune
+```
+
+
+## Neural Network
+
+```{r}
+## tuning
+set.seed(1)
+runs <- tuning_run("keras_grid_search.R", 
+                   flags = list(
+                   nodes_layer1 = c(64, 128, 256),
+                   nodes_layer2 = c(64, 128, 256),
+                   nodes_layer3 = c(64, 128, 256),
+                   dropout_layer1 = c(0.2, 0.3, 0.4),
+                   dropout_layer2 = c(0.2, 0.3, 0.4),
+                   dropout_layer3 = c(0.2, 0.3, 0.4)),
+                   confirm = FALSE,
+                   echo = FALSE,
+                   sample = 0.01) # try more after class
+
+best = runs[which.max(runs$metric_val_accuracy),]
+best
+```
+
+```{r}
+y_c = ifelse(y=="vacc",1,0)
+y_c <- to_categorical(y_c, 2)
+y2_c = ifelse(y2=="vacc",1,0)
+y2_c <- to_categorical(y2_c, 2)
+
+model.nn <- keras_model_sequential() %>%
+  layer_dense(units = best$flag_nodes_layer1, activation = "relu", input_shape = ncol(x)) %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = best$flag_dropout_layer1) %>%
+  layer_dense(units = best$flag_nodes_layer2, activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = best$flag_dropout_layer2) %>%
+  layer_dense(units = best$flag_nodes_layer3, activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = best$flag_dropout_layer3) %>%
+  layer_dense(units = 2, activation = "sigmoid") %>%
+  compile(loss = "categorical_crossentropy",
+          optimizer = optimizer_rmsprop(), 
+          metrics = "accuracy") 
+fit.nn = model.nn %>% 
+  fit(x = x, 
+      y = y_c, 
+      epochs = 30, 
+      batch_size = 256,
+      validation_split = 0.2,
+      callbacks = list(callback_early_stopping(patience = 5),
+                       callback_reduce_lr_on_plateau()),
+      verbose = 2)
+plot(fit.nn)
+
+## testing and evaluation
+score <- model.nn %>% evaluate(x2, y2_c)
+score
+```
+
+
+# Model Comparison
+
+## CV Compare
+```{r}
+res <- resamples(list(GLMNET = model.glmn, 
+                      GAM = model.gam,
+                      LDA = model.lda,
+                      RF = rf.fit,
+                      SVML = svml.fit,
+                      SVMR = svmr.fit))
+
+#KNN
+summary(res)
+
+# figure 4
+bwplot(res, metric = "ROC")
+```
+
+## Test data performance
+
+```{r, results='hide', warning=FALSE}
+# raw pred
+glmn.pred <- predict(model.glmn, newdata = x2, type = "raw")
+gam.pred <- predict(model.gam, newdata = data[-rowTrain,-c(7:8)], type = "raw")
+lda.pred <- predict(model.lda, newdata = x2, type = "raw")
+rf.pred <- predict(rf.fit, newdata = data[-rowTrain,], type = "raw")
+
+svml.pred <- predict(svml.fit, newdata = dat[-rowTrain,], type = "raw")
+svmr.pred <- predict(svmr.fit, newdata = dat[-rowTrain,], type = "raw")
+
+pred_test <- model.nn %>% predict(x2) %>% k_argmax() %>% as.matrix() %>% as.numeric()
+nn.pred = ifelse(pred_test==0,"no_vacc","vacc")
+nn.pred = factor(nn.pred,levels = c("no_vacc","vacc"))
+
+# Confusion Matrix
+cm.glmn = confusionMatrix(data = glmn.pred, reference = y2, positive = "vacc")$overall
+cm.gam = confusionMatrix(data = gam.pred, reference = y2, positive = "vacc")$overall
+cm.lda = confusionMatrix(data = lda.pred, reference = y2, positive = "vacc")$overall
+cm.rf = confusionMatrix(data = rf.pred, reference = y2, positive = "vacc")$overall
+cm.svml = confusionMatrix(data = svml.pred, reference = y2, positive = "vacc")$overall
+cm.svmr = confusionMatrix(data = svmr.pred, reference = y2, positive = "vacc")$overall
+cm.nn = confusionMatrix(data = nn.pred, reference = y2, positive = "vacc")$overall
+
+cm_df = data.frame(GLMN = cm.glmn, GAM = cm.gam, LDA = cm.lda, RF = cm.rf, SVML = cm.svml, SVMR = cm.svmr, NN = cm.nn)
+knitr::kable(cm_df, digits = 4)
+```
+
+```{r}
+glmn.pred <- predict(model.glmn, newdata = x2, type = "prob")[,2]
+gam.pred <- predict(model.gam, newdata = data[-rowTrain,-c(7:8)], type = "prob")[,2]
+lda.pred <- predict(model.lda, newdata = x2, type = "prob")[,2]
+rf.pred <- predict(rf.fit, newdata = data[-rowTrain,], type = "prob")[,2]
+svml.pred <- predict(svml.fit, newdata = dat[-rowTrain,], type = "prob")[,2]
+svmr.pred <- predict(svmr.fit, newdata = dat[-rowTrain,], type = "prob")[,2]
+
+pred_test <- model.nn %>% predict(x2)
+nn.pred = pred_test[,2]
+
+roc.glmn <- roc(y2, glmn.pred)
+roc.gam <- roc(y2, gam.pred)
+roc.lda <- roc(y2, lda.pred)
+roc.rf <- roc(y2, rf.pred)
+roc.svml <- roc(y2,svml.pred)
+roc.svmr <- roc(y2,svmr.pred)
+roc.nn = roc(y2,nn.pred)
+
+auc <- c(roc.glmn$auc[1], 
+         roc.gam$auc[1], 
+         roc.lda$auc[1],
+         roc.rf$auc[1],
+         roc.svml$auc[1],
+         roc.svmr$auc[1], 
+         roc.nn$auc[1])
+
+modelNames <- c("glmn","gam","lda","rf","svml","svmr","nn")
+
+# fig 5
+ggroc(list(roc.glmn, roc.gam, roc.lda, roc.rf,roc.svml, roc.svmr, roc.nn), 
+      legacy.axes = TRUE) + 
+  scale_color_discrete(labels = paste0(modelNames, " (", round(auc,3),")"),
+                       name = "Models (AUC)") +
+  geom_abline(intercept = 0, slope = 1, color = "grey")
+```
+
